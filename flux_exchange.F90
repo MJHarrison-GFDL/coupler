@@ -569,9 +569,15 @@ real, parameter :: d378 = 1.0-d622
   logical :: do_runoff = .TRUE. !< Turns on/off the land runoff interpolation to the ocean
   logical :: do_forecast = .false.
   integer :: nblocks = 1
+  logical :: partition_fprec_from_lprec = .FALSE.  ! option for ATM override experiments where liquid+frozen precip are combined
+                                                   ! This option will convert liquid precip to snow when t_ref is less than
+                                                   ! tfreeze parameter                
+  real, parameter    :: tfreeze = 273.15
+  
 
 namelist /flux_exchange_nml/ z_ref_heat, z_ref_mom, ex_u_star_smooth_bug, sw1way_bug, &
-         do_area_weighted_flux, debug_stocks, divert_stocks_report, do_runoff, do_forecast, nblocks
+     do_area_weighted_flux, debug_stocks, divert_stocks_report, do_runoff, do_forecast, nblocks, &
+     partition_fprec_from_lprec
 
   integer              :: my_nblocks = 1
   integer, allocatable :: block_start(:), block_end(:)
@@ -2438,7 +2444,8 @@ subroutine flux_down_from_atmos (Time, Atm, Land, Ice, &
   logical :: used
   logical :: ov
   integer :: ier
-
+  integer :: is_atm, ie_atm, js_atm, je_atm, i, j
+  
   character(32) :: tr_name ! name of the tracer
   integer :: tr, n, m ! tracer indices
   integer :: is, ie, l, i
@@ -2461,6 +2468,19 @@ subroutine flux_down_from_atmos (Time, Atm, Land, Ice, &
   call data_override ('ATM', 'flux_sw_vis_dif',  Atm%flux_sw_vis_dif, Time)
   call data_override ('ATM', 'flux_lw',  Atm%flux_lw, Time)
   call data_override ('ATM', 'lprec',    Atm%lprec,   Time)
+
+  if (partition_fprec_from_lprec .and. Atm%pe) then
+      call mpp_get_compute_domain(Atm%Domain, is_atm, ie_atm, js_atm, je_atm)
+      do j=js_atm,je_atm
+         do i=is_atm, ie_atm
+            if (Atm%t_bot(i,j) < tfreeze) then
+                Atm%fprec(i,j) = Atm%lprec(i,j)
+                Atm%lprec(i,j) = 0.0
+            endif
+         enddo
+      enddo
+  endif
+  
   call data_override ('ATM', 'fprec',    Atm%fprec,   Time)
   call data_override ('ATM', 'coszen',   Atm%coszen,  Time)
   call data_override ('ATM', 'dtmass',   Atm%Surf_Diff%dtmass, Time)
