@@ -2448,7 +2448,7 @@ subroutine flux_down_from_atmos (Time, Atm, Land, Ice, &
   
   character(32) :: tr_name ! name of the tracer
   integer :: tr, n, m ! tracer indices
-  integer :: is, ie, l, i
+  integer :: is, ie, l
 
 !Balaji
   call mpp_clock_begin(cplClock)
