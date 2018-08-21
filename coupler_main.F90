@@ -658,7 +658,7 @@ program coupler_main
        if (slow_ice_with_ocean) call mpp_set_current_pelist(Ocean%pelist)
        call mpp_clock_begin(newClock2)
        !Redistribute quantities from Ocean to Ocean_ice_boundary
-       !Ice intent is In. 
+       !Ice intent is In.
        !Ice is used only for accessing Ice%area and knowing if we are on an Ice pe
        call flux_ocean_to_ice( Time, Ocean, Ice, Ocean_ice_boundary )
        call mpp_clock_end(newClock2)
@@ -952,16 +952,17 @@ program coupler_main
 
      if (do_ice .and. Ice%pe) then
         call mpp_clock_begin(newClock5) !Ice is still using ATM pelist and need to be included in ATM clock
-                                        !ATM clock is used for load-balancing the coupled models 
+                                        !ATM clock is used for load-balancing the coupled models
 
         if (Ice%fast_ice_PE) then
            call mpp_clock_begin(newClock10f)
            if (ice_npes .NE. atmos_npes) call mpp_set_current_pelist(Ice%fast_pelist)
 
           ! These two calls occur on whichever PEs handle the fast ice processess.
+           call unpack_land_ice_boundary(Ice, Land_ice_boundary)
+
            call ice_model_fast_cleanup(Ice)
 
-           call unpack_land_ice_boundary(Ice, Land_ice_boundary)
            call mpp_clock_end(newClock10f)
         endif
 
