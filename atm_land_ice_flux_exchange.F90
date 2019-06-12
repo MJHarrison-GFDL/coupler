@@ -65,6 +65,7 @@ module atm_land_ice_flux_exchange_mod
                                 get_diag_field_id, DIAG_FIELD_NOT_FOUND
   use diag_data_mod,      only: CMOR_MISSING_VALUE, null_axis_id
   use  time_manager_mod,  only: time_type
+  use time_interp_external_mod, only : time_interp_external
   use sat_vapor_pres_mod, only: compute_qs, sat_vapor_pres_init
   use      constants_mod, only: rdgas, rvgas, cp_air, stefan, WTMAIR, HLV, HLF, Radius, &
                                 PI, CP_OCEAN, WTMCO2, WTMC
@@ -72,6 +73,7 @@ module atm_land_ice_flux_exchange_mod
   use fms_mod,            only: open_namelist_file, write_version_number
   use data_override_mod,  only: data_override
   use coupler_types_mod,  only: coupler_1d_bc_type, coupler_type_copy, ind_psurf, ind_u10
+  use coupler_types_mod,       only: surface_mass_balance_type
   use ocean_model_mod,    only: ocean_model_init_sfc, ocean_model_flux_init, ocean_model_data_get
 #ifdef use_AM3_physics
   use atmos_tracer_driver_mod, only: atmos_tracer_flux_init
@@ -148,7 +150,7 @@ module atm_land_ice_flux_exchange_mod
              id_t_ca,   id_q_surf, id_q_atm, id_z_atm, id_p_atm, id_gust, &
              id_t_ref_land, id_rh_ref_land, id_u_ref_land, id_v_ref_land, &
              id_q_ref,  id_q_ref_land, id_q_flux_land, id_rh_ref_cmip, &
-             id_hussLut_land, id_tasLut_land
+             id_hussLut_land, id_tasLut_land, id_pr
   integer :: id_co2_atm_dvmr, id_co2_surf_dvmr
 
   integer, allocatable :: id_tr_atm(:), id_tr_surf(:), id_tr_flux(:), id_tr_mol_flux(:)
@@ -568,13 +570,14 @@ contains
 
     ! This call sets up a structure that is private to the ice model, and it
     ! does not belong here.  This line should be eliminated once an update
-    ! to the FMS coupler_types code is made available that overloads the 
+    ! to the FMS coupler_types code is made available that overloads the
     ! subroutine coupler_type_copy to use 2d and 3d coupler type sources. -RWH
     call coupler_type_copy(ex_gas_fluxes, Ice%ocean_fluxes_top, is, ie, js, je, kd,     &
          'ice_flux', Ice%axes, Time, suffix = '_ice_top')
 
     !allocate land_ice_atmos_boundary
     call mpp_get_compute_domain( Atm%domain, is, ie, js, je )
+    land_ice_atmos_boundary%isphum = isphum ! mjh: save specific humidity index for later use
     allocate( land_ice_atmos_boundary%t(is:ie,js:je) )
     allocate( land_ice_atmos_boundary%u_ref(is:ie,js:je) )  ! bqx
     allocate( land_ice_atmos_boundary%v_ref(is:ie,js:je) )  ! bqx
@@ -597,8 +600,9 @@ contains
     allocate( land_ice_atmos_boundary%q_star(is:ie,js:je) )
 #ifndef use_AM3_physics
     allocate( land_ice_atmos_boundary%shflx(is:ie,js:je) )!miz
-    allocate( land_ice_atmos_boundary%lhflx(is:ie,js:je) )!miz
 #endif
+    allocate( land_ice_atmos_boundary%lhflx(is:ie,js:je) )!miz
+
     allocate( land_ice_atmos_boundary%rough_mom(is:ie,js:je) )
     allocate( land_ice_atmos_boundary%frac_open_sea(is:ie,js:je) )
     ! initialize boundary values for override experiments (mjh)
@@ -624,8 +628,9 @@ contains
     land_ice_atmos_boundary%q_star=0.0
 #ifndef use_AM3_physics
     land_ice_atmos_boundary%shflx=0.0
-    land_ice_atmos_boundary%lhflx=0.0
+
 #endif
+    land_ice_atmos_boundary%lhflx=0.0
     land_ice_atmos_boundary%rough_mom=0.01
     land_ice_atmos_boundary%frac_open_sea=0.0
 
@@ -1670,7 +1675,7 @@ contains
        used = send_tile_averaged_data ( id_t_ref_land, diag_land, &
                Land%tile_size, Time, mask = Land%mask )
 #endif
- 
+
     endif
     if(id_rh_ref_cmip > 0 .or. id_hurs > 0 .or. id_rhs > 0) then
        call get_from_xgrid (diag_atm, 'ATM', ex_ref2, xmap_sfc)
@@ -1849,7 +1854,7 @@ contains
   !!        flux_v_ice = meridional wind stress (Pa)
   !!        coszen_ice = cosine of the zenith angle
   !! </pre>
-  subroutine flux_down_from_atmos (Time, Atm, Land, Ice, Atmos_boundary, Land_boundary, Ice_boundary )
+  subroutine flux_down_from_atmos (Time, Atm, Land, Ice, Atmos_boundary, Land_boundary, Ice_boundary , SMB)
     type(time_type),       intent(in)    :: Time !< Current time
     type(atmos_data_type), intent(inout) :: Atm  !< A derived data type to specify atmosphere boundary data
     type(land_data_type),  intent(in)    :: Land !< A derived data type to specify land boundary data
@@ -1860,6 +1865,7 @@ contains
                                                                      !! passed from atmosphere to land
     type(atmos_ice_boundary_type),     intent(inout):: Ice_boundary !< A derived data type to specify properties and fluxes passed
                                                                     !! from atmosphere to ice
+    type(surface_mass_balance_type), dimension(3), optional :: SMB
 
     real, dimension(n_xgrid_sfc) :: ex_flux_sw, ex_flux_lwd, &
          ex_flux_sw_dir,  &
@@ -1882,6 +1888,7 @@ contains
     real :: setl_flux(size(Atm%tr_bot,1),size(Atm%tr_bot,2))
     real :: dsetl_dtr(size(Atm%tr_bot,1),size(Atm%tr_bot,2))
 
+    logical :: smb_present=.false.
 
     real, dimension(n_xgrid_sfc) :: ex_gamma  , ex_dtmass,  &
          ex_delta_t, ex_delta_u, ex_delta_v, ex_dflux_t
@@ -1898,12 +1905,15 @@ contains
 
     character(32) :: tr_name ! name of the tracer
     integer :: tr, n, m ! tracer indices
-    integer :: is, ie, l, i
+    integer :: is, ie, l, i, k
 
     !Balaji
     call mpp_clock_begin(cplClock)
     call mpp_clock_begin(fluxAtmDnClock)
     ov = .FALSE.
+
+    smb_present=.false.
+    if (PRESENT(SMB)) smb_present=.true.
     !-----------------------------------------------------------------------
     !Balaji: data_override calls moved here from coupler_main
     call data_override ('ATM', 'flux_sw',  Atm%flux_sw, Time)
@@ -1951,6 +1961,28 @@ contains
        call data_override ('ATM', 'delta_'//trim(tr_name),  Atm%Surf_Diff%delta_tr(:,:,tr), Time)
        call data_override ('ATM', 'dflux_'//trim(tr_name),  Atm%Surf_Diff%dflux_tr(:,:,tr), Time)
     enddo
+
+    if (smb_present) then
+
+       ! do not actually modify precipitation here, but calculate new scale factors
+       call update_surface_mass_balance(Atm,Atmos_boundary,SMB(1),Time)
+       call update_surface_mass_balance(Atm,Atmos_boundary,SMB(2),Time)
+       call smb_balance(Atm,Smb(1),Smb(2),SMB(3),Atmos_boundary)
+
+       call mpp_get_compute_domain(Atm%Domain, is_atm, ie_atm, js_atm, je_atm)
+
+       do k=1,3
+         do j=js_atm,je_atm
+           do i=is_atm,ie_atm
+             if (Smb(k)%mask(i,j) .eq. 1.0) then
+                Atm%lprec(i,j)=Atm%lprec(i,j)*Smb(k)%scale_factor
+                Atm%fprec(i,j)=Atm%fprec(i,j)*Smb(k)%scale_factor
+             endif
+           enddo
+         enddo
+       enddo
+    endif
+
 
     !---- put atmosphere quantities onto exchange grid ----
 
@@ -2214,6 +2246,11 @@ contains
 !!$        call divide_by_area(data=Land_boundary%fprec(:,:,k), area=AREA_ATM_MODEL)
 !!$     enddo
 !!$  endif
+
+
+    if( id_pr > 0 )  then
+       used = send_data ( id_pr, Atm%lprec+Atm%fprec, Time)
+    endif
 
     if(associated(Land_boundary%drag_q)) then
        call get_from_xgrid_land (Land_boundary%drag_q, 'LND', ex_drag_q,    xmap_sfc)
@@ -2548,7 +2585,7 @@ contains
          ex_co2_surf_dvmr   ! updated CO2 tracer values at the surface (dry vmr)
 
     real, dimension(size(Land_Ice_Atmos_Boundary%dt_t,1),size(Land_Ice_Atmos_Boundary%dt_t,2)) :: diag_atm, &
-         evap_atm, frac_atm
+         evap_atm, frac_atm, pr_atm, fpr_atm
 #ifndef _USE_LEGACY_LAND_
     real, dimension(size(Land_boundary%lprec,1), size(Land_boundary%lprec,2)) :: data_lnd, diag_land
 #else
@@ -2700,8 +2737,10 @@ contains
     call get_from_xgrid (Land_Ice_Atmos_Boundary%dt_t, 'ATM', ex_delta_t_n, xmap_sfc)
 #ifndef use_AM3_physics
     call get_from_xgrid (Land_Ice_Atmos_Boundary%shflx,'ATM', ex_flux_t    , xmap_sfc) !miz
-    call get_from_xgrid (Land_Ice_Atmos_Boundary%lhflx,'ATM', ex_flux_tr(:,isphum), xmap_sfc)!miz
 #endif
+
+    call get_from_xgrid (Land_Ice_Atmos_Boundary%lhflx,'ATM', ex_flux_tr(:,isphum), xmap_sfc)!miz
+
 
     !=======================================================================
     !-------------------- diagnostics section ------------------------------
@@ -2825,6 +2864,13 @@ contains
     !-----------------------------------------------------------------------
     !---- accumulate global integral of evaporation (mm/day) -----
     call get_from_xgrid (evap_atm, 'ATM', ex_flux_tr(:,isphum), xmap_sfc)
+
+    !-----------------------------------------------------------------------
+    !---- calculate surface mass balance diagnostics for precipitation
+    !---- adjustments in subsequent timesteps
+    !-----------------------------------------------------------------------
+
+
     if( id_q_flux > 0 )  used = send_data ( id_q_flux, evap_atm, Time)
     if( id_evspsbl > 0 ) used = send_data ( id_evspsbl, evap_atm, Time)
     if( id_hfls    > 0 ) used = send_data ( id_hfls, HLV*evap_atm, Time)
@@ -3367,6 +3413,9 @@ contains
     id_q_flux = register_diag_field( mod_name, 'evap',       atmos_axes, Time, &
          'evaporation rate',        'kg/m2/s'  )
 
+    id_pr = register_diag_field( mod_name, 'prec_tot',       atmos_axes, Time, &
+         'total precipitation rate',        'kg/m2/s'  )
+
     !--------------------------------------------------------------------
     !    retrieve the diag_manager id for the area diagnostic,
     !    needed for cmorizing various diagnostics.
@@ -3734,6 +3783,117 @@ contains
          & radius=Radius, res=res, ier=ier)
 
   end subroutine atm_stock_integrate
+
+
+  subroutine update_surface_mass_balance(Atm, LIAb, Smb,Time)
+
+    type (atmos_data_type), intent(in) :: Atm
+    type(land_ice_atmos_boundary_type), intent(in) :: LIAb
+    type(surface_mass_balance_type), intent(inout)  :: Smb
+    type(time_type), intent(in) :: Time
+
+    integer :: is, ie, js, je
+    integer :: i,j,cwlen
+    real :: lat1, lat2
+    real :: avg, dif, pr_scale
+    real :: min_lat, max_lat
+
+    call mpp_get_compute_domain(Atm%Domain, is, ie, js, je)
+
+!    call mpp_set_current_pelist(Atm%pelist)
+
+    do j=js,je
+      do i=is,ie
+        Smb%smb_in(i,j) = Smb%mask(i,j)*Atm%grid%area(i,j)*(Atm%lprec(i,j) + Atm%fprec(i,j))
+        Smb%smb_out(i,j) = Smb%mask(i,j)*Atm%grid%area(i,j)*LIAb%lhflx(i,j)
+        Smb%smb(i,j) = Smb%smb_in(i,j) - Smb%smb_out(i,j)
+      enddo
+    enddo
+
+    Smb%total=sum(Smb%smb)
+    call mpp_sum(Smb%total)
+    Smb%total_in=sum(Smb%smb_in)
+    call mpp_sum(Smb%total_in)
+    Smb%total_out=sum(Smb%smb_out)
+    call mpp_sum(Smb%total_out)
+    Smb%sum_mask=sum(Smb%mask)
+    call mpp_sum(Smb%sum_mask)
+    cwlen=0
+    do i=1,size(Smb%smb_hist)
+      if (Smb%smb_hist(i)==0.0) then
+         cwlen=i-1
+         exit
+      endif
+    enddo
+    if (cwlen<size(Smb%smb_hist)) then
+       Smb%smb_hist(cwlen+1)=Smb%total
+       avg = sum(Smb%smb_hist)/(cwlen+1)
+    else
+       Smb%smb_hist=cshift(Smb%smb_hist,1)
+       Smb%smb_hist(cwlen)=Smb%total
+       avg = sum(Smb%smb_hist)/cwlen
+    endif
+
+    if (Smb%read_pmt) call time_interp_external(Smb%id_target, Time, Smb%smb_target )
+
+    dif = Smb%smb_target - avg
+    pr_scale=1.0
+    if (Smb%total_in  > 0.) pr_scale = 1.0 + dif/Smb%total_in
+    Smb%scale_factor = pr_scale
+
+    Smb%total = Smb%scale_factor*Smb%total_in - Smb%total_out
+
+    if (mpp_pe()==mpp_root_pe()) print *,'scale factor for precip= ',Smb%scale_factor, Smb%total, Smb%total_in, Smb%total_out
+!    call mpp_set_current_pelist()
+    return
+
+  end subroutine update_surface_mass_balance
+
+  subroutine smb_balance(Atm,SmbA,SmbB,SmbC,LIAb)
+    type(atmos_data_type), intent(in) :: Atm
+    type(surface_mass_balance_type), intent(inout)  :: SmbA,SmbB
+    type(surface_mass_balance_type), intent(inout)  :: SmbC
+    type(land_ice_atmos_boundary_type), intent(in) :: LIAb
+
+    integer :: is, ie, js, je
+    integer :: i,j
+    real :: dif, pr_scale
+
+
+    SmbC%smb_target = -1.0*(SmbA%total + SmbB%total)
+
+    call mpp_get_compute_domain(Atm%Domain, is, ie, js, je)
+
+!    call mpp_set_current_pelist(Atm%pelist)
+
+    do j=js,je
+      do i=is,ie
+        SmbC%smb_in(i,j) = SmbC%mask(i,j)*Atm%grid%area(i,j)*(Atm%lprec(i,j) + Atm%fprec(i,j))
+        SmbC%smb_out(i,j) = SmbC%mask(i,j)*Atm%grid%area(i,j)*LIAb%lhflx(i,j)
+        SmbC%smb(i,j)=SmbC%smb_in(i,j)-SmbC%smb_out(i,j)
+      enddo
+    enddo
+
+    SmbC%total=sum(SmbC%smb)
+    call mpp_sum(SmbC%total)
+    SmbC%total_in=sum(SmbC%smb_in)
+    call mpp_sum(SmbC%total_in)
+    SmbC%total_out=sum(SmbC%smb_out)
+    call mpp_sum(SmbC%total_out)
+
+    dif = SmbC%smb_target - SmbC%total
+    pr_scale=1.0
+    SmbC%scale_factor=1.0
+    if (SmbC%total_in  > 0.) pr_scale = 1.0 + dif/SmbC%total_in
+    if (pr_scale>0.) SmbC%scale_factor = pr_scale
+
+    if (mpp_pe()==mpp_root_pe()) print *,'smb totals = ',SmbA%total, SmbB%total, SmbC%total, SmbC%total_in, SmbC%total_out,SmbC%scale_factor,&
+                                       Smbc%total_in*SmbC%scale_Factor-SmbC%total_out
+!    call mpp_set_current_pelist()
+
+    return
+
+  end subroutine smb_balance
 
 !#########################################################################
 
